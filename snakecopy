@@ -1,0 +1,251 @@
+#!/usr/bin/python3 -u
+
+import sys
+import re
+import os
+import stat
+import subprocess
+import argparse
+import threading
+
+class TeeOut(threading.Thread):
+      def __init__(self, pipe_out, qmax=-1, blocking=True, debug=False):
+            threading.Thread.__init__(self, name="TeeOut({})".format(pipe_out))
+            if not blocking:
+                  raise NotImplementedError
+            if qmax >= 0:
+                  raise NotImplementedError
+            self.ocnt = 0
+            self._q = []
+            self._debug = debug
+            self._cv = threading.Condition()
+            self._pout = pipe_out
+      def run(self):
+            while True:
+                  d = None
+                  with self._cv:
+                        while len(self._q) == 0:
+                              self._cv.wait()
+                        d = self._q.pop(0)
+                  self.ocnt += len(d)
+                  if len(d) > 0:
+                        self._pout.write(d)
+                        if self._debug:
+                              sys.stderr.write("[>{}]".format(len(d)))
+                              sys.stderr.flush()
+                  else:
+                        # stream end
+                        self._pout.close()
+                        if self._debug:
+                              sys.stderr.write("[>EOF]")
+                              sys.stderr.flush()
+                        break
+            return
+      def push(self, d):
+            with self._cv:
+                  self._q.append(d)
+                  self._cv.notify()
+
+class Tee(threading.Thread):
+      def __init__(self, pipe_in, pipe_outs, bs=512, debug=False):
+            threading.Thread.__init__(self, name="Tee")
+            self._i = pipe_in
+            self.icnt = 0
+            self._o = []
+            self._debug = debug
+            for po in pipe_outs:
+                  tout = TeeOut(po, debug=debug)
+                  self._o.append(tout)
+                  tout.start()
+            self._bs = bs
+      def run(self):
+            if self._debug:
+                  sys.stderr.write("[T]")
+                  sys.stderr.flush()
+            while True:
+                  d = self._i.read(self._bs)
+                  self.icnt += len(d)
+                  if self._debug:
+                        sys.stderr.write("[{}>]".format(len(d)))
+                        sys.stderr.flush()
+                  for tout in self._o:
+                        tout.push(d)
+                  if len(d) == 0:
+                        break
+            # wait until output drain
+            for tout in self._o:
+                  tout.join()
+
+      def ocnts(self):
+            return [o.ocnt for o in self._o]
+
+def mkhdr(nodes, config):
+      hdrL = []
+      hdrL.append(str(config["bufsize"]))
+      hdrL.append(config["localcmd"])
+      hdrL.append(config["remotecmd_template"])
+      hdrL += nodes
+      hdrL.append('')
+      hdrL.append('') # to make last empty line
+      return '\n'.join(hdrL).encode('us-ascii')
+
+def naive_readline(instream):
+      lL = []
+      while True:
+            c = instream.read(1)
+            if c == b'\n':
+                  break
+            if len(c) == 0:
+                  raise EOFError
+            lL.append(c)
+      return b''.join(lL)
+
+def parsehdr(instream, logf=sys.stderr):
+      l1=naive_readline(instream)
+      bufsize = int(l1)
+      logf.write("[buffersize:{}]".format(bufsize))
+      localcmd = naive_readline(instream)
+      logf.write("[localcmd:{}]".format(localcmd))
+      remotecmd = naive_readline(instream)
+      logf.write("[remotecmd:{}]".format(remotecmd))
+      nodes = []
+      while True:
+            host = naive_readline(instream)
+            if len(host) == 0:
+                  break
+            logf.write("[host:{}]".format(host))
+            nodes.append(host)
+      config = {
+            "remotecmd_template": remotecmd,
+            "localcmd": localcmd,
+            "bufsize": bufsize,
+            }
+      return nodes, config            
+      
+def slave():
+      logf = open("/tmp/slave.log", "w")
+      def slog(content):
+            logf.write(content)
+            logf.flush()
+
+      slog("[slave: reading log]\n")
+      nodes, config = parsehdr(sys.stdin.buffer, logf=logf)
+      slog("[nodes are: {}]".format(nodes))
+      if len(nodes) > 0:
+            slog("[slave mid start]\n")
+            head = nodes[0]
+            body = nodes[1:]
+            hdr = mkhdr(body, config)
+            localcmd = subprocess.Popen(config["localcmd"],
+                                        bufsize=config["bufsize"],
+                                        stdin=subprocess.PIPE,
+                                        stdout=sys.stdout.buffer,
+                                        stderr=sys.stderr,
+                                        shell=True,
+                                        cwd="/")
+            remotecmd = subprocess.Popen(config["remotecmd_template"].format(head=head),
+                                        bufsize=config["bufsize"],
+                                        stdin=subprocess.PIPE,
+                                        stdout=sys.stdout.buffer,
+                                        stderr=sys.stderr,
+                                        shell=True)
+            remotecmd.stdin.write(hdr)
+            tee = Tee(sys.stdin.buffer, [localcmd.stdin, remotecmd.stdin], bs=config.bufsize)
+            tee.start()
+            localcmd.wait()
+            assert localcmd.returncode==0
+            remotecmd.wait()
+            assert remotecmd.returncode==0
+            tee.join()
+      else:
+            slog("[slave tail start]\n")
+            # I'm the tail end of the snake copy. let's just run the localcmd
+            localcmd = subprocess.Popen(config["localcmd"],
+                                        bufsize=config["bufsize"],
+                                        stdin=sys.stdin.buffer,
+                                        stdout=sys.stdout.buffer,
+                                        stderr=sys.stderr,
+                                        shell=True)
+            slog("[slave tail local wait]\n")
+            localcmd.wait()
+            assert localcmd.returncode==0
+
+def main(argv):
+      parser = argparse.ArgumentParser(description="snakecopy")
+      parser.add_argument("--inventry", "-i", default="./hosts.txt")
+      parser.add_argument("--slave", action="store_true", default=False)
+      parser.add_argument("--bufsize", type=int, default=1400)
+      parser.add_argument("srcpath", default=None, nargs='?')
+      args = parser.parse_args(argv[1:])
+      print('args:', args)
+      
+
+      config = {
+            "mastercmd": "tar zcf - {srcpath}",
+            "remotecmd_template": "ssh -A {head} snakecopy --slave",
+            #"localcmd": "tar -C / -zxvf -",
+            "localcmd": "cat > /tmp/slave.out",
+            "bufsize": args.bufsize,
+      }
+
+      if args.slave:
+            return slave()
+
+      # master process
+      # equiv: (mkhdr nodes[1:] ; tar zcf - path) | ssh -A nodes[0] snakecopy --slave
+      if args.srcpath == None:
+            parser.print_usage()
+            raise SystemExit("no path given")
+      if args.srcpath[0] != '/':
+            parser.print_usage()
+            raise SystemExit("path MUST be absolute path\n-- and all nodes shall have same directory structure!")
+      if len(args.srcpath) < int(os.getenv("SNAKECOPY_PATHLEN_MIN", 5)):
+            raise SystemExit("""\
+path length({}) is too short. This is a kind reminder not to overwrite whole system!
+-- if you are quite sure, please set SNAKECOPY_PATHLEN_MIN envirionment variable
+   to appropriate number!""".format(len(args.srcpath)))
+
+      m = os.stat(args.srcpath).st_mode
+      if not (stat.S_ISDIR(m) or stat.S_ISREG(m)):
+            raise SystemExit("given path is not a normal file nor directory.")
+
+      with open(args.inventry, 'r') as f:
+            lines = f.readlines()
+      nodes = filter(lambda h: len(h)>0, [re.sub(r'#.*$', '', ln).strip() for ln in lines])
+      nodes = list(nodes)
+      head = nodes[0]
+      body = nodes[1:]
+      hdr = mkhdr(body, config)
+      print("hdr: [{}]".format(hdr))
+
+      mastercmd = subprocess.Popen(config["mastercmd"].format(srcpath=args.srcpath),
+                                   bufsize=args.bufsize,
+                                   stdin=None,
+                                   stdout=subprocess.PIPE,
+                                   stderr=sys.stderr,
+                                   shell=True,
+                                   cwd="/")
+      remotecmd = subprocess.Popen(config["remotecmd_template"].format(head=head),
+                                  bufsize=args.bufsize,
+                                  stdin=subprocess.PIPE,
+                                  stdout=sys.stdout.buffer,
+                                  stderr=sys.stderr,
+                                  shell=True)
+      #debugcmd = subprocess.Popen("cat > /tmp/master.out",
+      #                            stdin=subprocess.PIPE, shell=True)
+                                  
+      remotecmd.stdin.write(hdr)
+      tee = Tee(mastercmd.stdout, [remotecmd.stdin], bs=args.bufsize, debug=True)
+      tee.start()
+      print('[master wait]')
+      mastercmd.wait()
+      assert mastercmd.returncode==0
+      print('[remote wait]')
+      remotecmd.wait()
+      assert remotecmd.returncode==0
+      tee.join()
+      print("read {}".format(tee.icnt))
+      print("writes: {}".format(tee.ocnts()))
+
+if __name__ == '__main__':
+      main(sys.argv)
