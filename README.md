@@ -21,7 +21,7 @@ HOST3
 [empty line]
 [binary data for stdin of the command]
 [EOS]
-`
+```
 
 ## hosts.txt
 
