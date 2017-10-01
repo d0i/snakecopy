@@ -92,7 +92,7 @@ def mkhdr(nodes, config):
 def naive_readline(instream):
       lL = []
       while True:
-            c = instream.read(1)
+            c = instream.read1(1)
             if c == b'\n':
                   break
             if len(c) == 0:
@@ -100,39 +100,29 @@ def naive_readline(instream):
             lL.append(c)
       return b''.join(lL)
 
-def parsehdr(instream, logf=sys.stderr):
+def parsehdr(instream):
       l1=naive_readline(instream)
       bufsize = int(l1)
-      logf.write("[buffersize:{}]".format(bufsize))
-      localcmd = naive_readline(instream)
-      logf.write("[localcmd:{}]".format(localcmd))
-      remotecmd = naive_readline(instream)
-      logf.write("[remotecmd:{}]".format(remotecmd))
+      localcmd = naive_readline(instream).decode('utf-8')
+      remotecmd = naive_readline(instream).decode('utf-8')
       nodes = []
       while True:
-            host = naive_readline(instream)
+            host = naive_readline(instream).decode('utf-8')
             if len(host) == 0:
                   break
-            logf.write("[host:{}]".format(host))
             nodes.append(host)
       config = {
             "remotecmd_template": remotecmd,
             "localcmd": localcmd,
             "bufsize": bufsize,
             }
+      
       return nodes, config            
       
 def slave():
-      logf = open("/tmp/slave.log", "w")
-      def slog(content):
-            logf.write(content)
-            logf.flush()
 
-      slog("[slave: reading log]\n")
-      nodes, config = parsehdr(sys.stdin.buffer, logf=logf)
-      slog("[nodes are: {}]".format(nodes))
+      nodes, config = parsehdr(sys.stdin.buffer)
       if len(nodes) > 0:
-            slog("[slave mid start]\n")
             head = nodes[0]
             body = nodes[1:]
             hdr = mkhdr(body, config)
@@ -150,7 +140,7 @@ def slave():
                                         stderr=sys.stderr,
                                         shell=True)
             remotecmd.stdin.write(hdr)
-            tee = Tee(sys.stdin.buffer, [localcmd.stdin, remotecmd.stdin], bs=config.bufsize)
+            tee = Tee(sys.stdin.buffer, [localcmd.stdin, remotecmd.stdin], bs=config["bufsize"])
             tee.start()
             localcmd.wait()
             assert localcmd.returncode==0
@@ -158,7 +148,6 @@ def slave():
             assert remotecmd.returncode==0
             tee.join()
       else:
-            slog("[slave tail start]\n")
             # I'm the tail end of the snake copy. let's just run the localcmd
             localcmd = subprocess.Popen(config["localcmd"],
                                         bufsize=config["bufsize"],
@@ -166,7 +155,6 @@ def slave():
                                         stdout=sys.stdout.buffer,
                                         stderr=sys.stderr,
                                         shell=True)
-            slog("[slave tail local wait]\n")
             localcmd.wait()
             assert localcmd.returncode==0
 
@@ -177,14 +165,14 @@ def main(argv):
       parser.add_argument("--bufsize", type=int, default=1400)
       parser.add_argument("srcpath", default=None, nargs='?')
       args = parser.parse_args(argv[1:])
-      print('args:', args)
       
 
       config = {
             "mastercmd": "tar zcf - {srcpath}",
             "remotecmd_template": "ssh -A {head} snakecopy --slave",
-            #"localcmd": "tar -C / -zxvf -",
-            "localcmd": "cat > /tmp/slave.out",
+            #"remotecmd_template": "cat > /tmp/snakecmd_{head}.out", # for debug
+            "localcmd": "tar -C / -zxpf -",
+            #"localcmd": "cat > /tmp/slave.out", # for debug
             "bufsize": args.bufsize,
       }
 
@@ -216,7 +204,6 @@ path length({}) is too short. This is a kind reminder not to overwrite whole sys
       head = nodes[0]
       body = nodes[1:]
       hdr = mkhdr(body, config)
-      print("hdr: [{}]".format(hdr))
 
       mastercmd = subprocess.Popen(config["mastercmd"].format(srcpath=args.srcpath),
                                    bufsize=args.bufsize,
@@ -235,17 +222,13 @@ path length({}) is too short. This is a kind reminder not to overwrite whole sys
       #                            stdin=subprocess.PIPE, shell=True)
                                   
       remotecmd.stdin.write(hdr)
-      tee = Tee(mastercmd.stdout, [remotecmd.stdin], bs=args.bufsize, debug=True)
+      tee = Tee(mastercmd.stdout, [remotecmd.stdin], bs=args.bufsize)
       tee.start()
-      print('[master wait]')
       mastercmd.wait()
       assert mastercmd.returncode==0
-      print('[remote wait]')
       remotecmd.wait()
       assert remotecmd.returncode==0
       tee.join()
-      print("read {}".format(tee.icnt))
-      print("writes: {}".format(tee.ocnts()))
 
 if __name__ == '__main__':
       main(sys.argv)
