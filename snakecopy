@@ -51,7 +51,6 @@ class Tee(threading.Thread):
                               data = self._i.read1(self._bs)
                               if len(data) == 0:
                                     input_eof = True
-                                    self._i.close()
                               else:
                                     self.icnt += len(data)
                                     for k in self._mqD:
@@ -155,13 +154,14 @@ def main(argv):
       parser.add_argument("--inventry", "-i", default="./hosts.txt")
       parser.add_argument("--slave", action="store_true", default=False)
       parser.add_argument("--bufsize", type=int, default=1400)
+      parser.add_argument("--snakecopy", type=str, default="snakecopy")
       parser.add_argument("srcpath", default=None, nargs='?')
       args = parser.parse_args(argv[1:])
       
 
       config = {
             "mastercmd": "tar zcf - {srcpath}",
-            "remotecmd_template": "ssh -A {head} snakecopy --slave",
+            "remotecmd_template": "ssh -A {head} {snakecopy} --slave",
             #"remotecmd_template": "cat > /tmp/snakecmd_{head}.out", # for debug
             "localcmd": "tar -C / -zxpf -",
             #"localcmd": "cat > /tmp/slave.out", # for debug
@@ -204,7 +204,7 @@ path length({}) is too short. This is a kind reminder not to overwrite whole sys
                                    stderr=sys.stderr,
                                    shell=True,
                                    cwd="/")
-      remotecmd = subprocess.Popen(config["remotecmd_template"].format(head=head),
+      remotecmd = subprocess.Popen(config["remotecmd_template"].format(head=head, snakecopy=args.snakecopy),
                                   bufsize=args.bufsize,
                                   stdin=subprocess.PIPE,
                                   stdout=sys.stdout.buffer,
