@@ -1,84 +1,76 @@
-#!/usr/bin/python3 -u
+#!/bin/sh
+''':'
+exec python3 -u "$0" "$@"
+'''
+# above trick is from here:
+# https://stackoverflow.com/questions/17458528/why-does-this-snippet-with-a-shebang-bin-sh-and-exec-python-inside-4-single-q
+
 
 import sys
 import re
 import os
 import stat
 import subprocess
+from socket import gethostname
 import argparse
 import threading
+import select
+import time
 
-class TeeOut(threading.Thread):
-      def __init__(self, pipe_out, qmax=-1, blocking=True, debug=False):
-            threading.Thread.__init__(self, name="TeeOut({})".format(pipe_out))
-            if not blocking:
-                  raise NotImplementedError
-            if qmax >= 0:
-                  raise NotImplementedError
-            self.ocnt = 0
-            self._q = []
-            self._debug = debug
-            self._cv = threading.Condition()
-            self._pout = pipe_out
-      def run(self):
-            while True:
-                  d = None
-                  with self._cv:
-                        while len(self._q) == 0:
-                              self._cv.wait()
-                        d = self._q.pop(0)
-                  self.ocnt += len(d)
-                  if len(d) > 0:
-                        self._pout.write(d)
-                        if self._debug:
-                              sys.stderr.write("[>{}]".format(len(d)))
-                              sys.stderr.flush()
-                  else:
-                        # stream end
-                        self._pout.close()
-                        if self._debug:
-                              sys.stderr.write("[>EOF]")
-                              sys.stderr.flush()
-                        break
-            return
-      def push(self, d):
-            with self._cv:
-                  self._q.append(d)
-                  self._cv.notify()
+def flagUp(flag, c):
+      return flag|(1<<c)
+def flagDown(flag, c):
+      return flag&~(1<<c)
+def isFlagUp(flag, c):
+      return flag&(1<<c) > 0
+
+__Hostname = gethostname()
 
 class Tee(threading.Thread):
       def __init__(self, pipe_in, pipe_outs, bs=512, debug=False):
             threading.Thread.__init__(self, name="Tee")
             self._i = pipe_in
             self.icnt = 0
-            self._o = []
+            self._oL = pipe_outs
+            self._mqD = {}
+            for o in self._oL:
+                  self._mqD[o.fileno()] = []
             self._debug = debug
-            for po in pipe_outs:
-                  tout = TeeOut(po, debug=debug)
-                  self._o.append(tout)
-                  tout.start()
             self._bs = bs
       def run(self):
-            if self._debug:
-                  sys.stderr.write("[T]")
-                  sys.stderr.flush()
-            while True:
-                  d = self._i.read(self._bs)
-                  self.icnt += len(d)
-                  if self._debug:
-                        sys.stderr.write("[{}>]".format(len(d)))
-                        sys.stderr.flush()
-                  for tout in self._o:
-                        tout.push(d)
-                  if len(d) == 0:
-                        break
-            # wait until output drain
-            for tout in self._o:
-                  tout.join()
-
-      def ocnts(self):
-            return [o.ocnt for o in self._o]
-
+            poller = select.poll()
+            poller.register(self._i, select.POLLIN|select.POLLHUP)
+            input_eof = False
+            mqStat = 0
+            while input_eof == False or mqStat > 0:
+                  r = poller.poll(10)
+                  if len(r) == 0:
+                        raise RuntimeError("too long freeze... shall not happen here in practice")
+                  for fd, ev in r:
+                        if ev & (select.POLLIN|select.POLLHUP):
+                              data = self._i.read1(self._bs)
+                              if len(data) == 0:
+                                    input_eof = True
+                                    self._i.close()
+                              else:
+                                    self.icnt += len(data)
+                                    for k in self._mqD:
+                                          self._mqD[k].append(data)
+                                          mqStat = flagUp(mqStat, k)
+                                          poller.register(k, select.POLLOUT)
+                        elif ev & select.POLLOUT and isFlagUp(mqStat, fd):
+                              mq = self._mqD[fd]
+                              data = mq.pop(0)
+                              if len(mq) == 0:
+                                    poller.unregister(fd)
+                                    mqStat = flagDown(mqStat, fd)
+                              l = os.write(fd, data)
+                              if l < len(data):
+                                    # push it back to next write
+                                    mq.insert(0, data[l:])
+            for o in self._oL:
+                  o.close()
+                  
 def mkhdr(nodes, config):
       hdrL = []
       hdrL.append(str(config["bufsize"]))
@@ -120,7 +112,6 @@ def parsehdr(instream):
       return nodes, config            
       
 def slave():
-
       nodes, config = parsehdr(sys.stdin.buffer)
       if len(nodes) > 0:
             head = nodes[0]
@@ -140,7 +131,8 @@ def slave():
                                         stderr=sys.stderr,
                                         shell=True)
             remotecmd.stdin.write(hdr)
-            tee = Tee(sys.stdin.buffer, [localcmd.stdin, remotecmd.stdin], bs=config["bufsize"])
+            remotecmd.stdin.flush()
+            tee = Tee(sys.stdin.buffer, [localcmd.stdin, remotecmd.stdin], bs=config["bufsize"], debug=True)
             tee.start()
             localcmd.wait()
             assert localcmd.returncode==0
@@ -171,7 +163,7 @@ def main(argv):
             "mastercmd": "tar zcf - {srcpath}",
             "remotecmd_template": "ssh -A {head} snakecopy --slave",
             #"remotecmd_template": "cat > /tmp/snakecmd_{head}.out", # for debug
-            "localcmd": "tar -C / -zxpf -",
+            "localcmd": "tar -C / -zxpf -; sleep 1",
             #"localcmd": "cat > /tmp/slave.out", # for debug
             "bufsize": args.bufsize,
       }
@@ -222,7 +214,8 @@ path length({}) is too short. This is a kind reminder not to overwrite whole sys
       #                            stdin=subprocess.PIPE, shell=True)
                                   
       remotecmd.stdin.write(hdr)
-      tee = Tee(mastercmd.stdout, [remotecmd.stdin], bs=args.bufsize)
+      remotecmd.stdin.flush()
+      tee = Tee(mastercmd.stdout, [remotecmd.stdin], bs=args.bufsize, debug=True)
       tee.start()
       mastercmd.wait()
       assert mastercmd.returncode==0
