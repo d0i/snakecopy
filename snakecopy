@@ -163,7 +163,7 @@ def main(argv):
             "mastercmd": "tar zcf - {srcpath}",
             "remotecmd_template": "ssh -A {head} snakecopy --slave",
             #"remotecmd_template": "cat > /tmp/snakecmd_{head}.out", # for debug
-            "localcmd": "tar -C / -zxpf -; sleep 1",
+            "localcmd": "tar -C / -zxpf -",
             #"localcmd": "cat > /tmp/slave.out", # for debug
             "bufsize": args.bufsize,
       }
